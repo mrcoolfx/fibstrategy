@@ -1,0 +1,4 @@
+python-telegram-bot==20.7
+# Match PTB's constraint to avoid resolver conflict
+httpx~=0.25.2
+pydantic>=2.7,<3

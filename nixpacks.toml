@@ -1,2 +1,2 @@
 [start]
-cmd = "python app/main.py"
+cmd = "python main.py"

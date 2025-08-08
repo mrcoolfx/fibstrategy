@@ -1,1 +1,2 @@
-start = "python main.py"
+[start]
+cmd = "python app/main.py"

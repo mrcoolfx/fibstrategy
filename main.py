@@ -329,7 +329,7 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
 
     # background task
-    app.job_queue.run_repeating(lambda ctx: None, interval=3600)  # keep JobQueue alive
+    # app.job_queue.run_repeating(lambda ctx: None, interval=3600)  # keep JobQueue alive
     # start alert loop
     app.post_init = lambda app: asyncio.create_task(alert_loop(app))
 

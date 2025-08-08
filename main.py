@@ -331,7 +331,11 @@ def main():
     # background task
     # app.job_queue.run_repeating(lambda ctx: None, interval=3600)  # keep JobQueue alive
     # start alert loop
-    app.post_init = lambda app: asyncio.create_task(alert_loop(app))
+    async def _post_init(app):
+        app.create_task(alert_loop(app))
+
+    app.post_init = _post_init
+
 
     log.info("Starting bot...")
     app.run_polling(close_loop=False)

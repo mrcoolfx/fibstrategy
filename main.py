@@ -1,5 +1,6 @@
 import asyncio
 import os
+import json
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Dict, Any, Optional
 
@@ -12,8 +13,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{contract}"
 POLL_SECONDS = 5 * 60  # 5 minutes
+STATE_PATH = os.environ.get("STATE_PATH", "/app/watchlist.json")  # where we save/load watchlist
 
-HEADERS = {"User-Agent": "fib75-telegram-bot/NEW-1.3"}
+HEADERS = {"User-Agent": "fib75-telegram-bot/1.5"}
 chat_state: Dict[int, Dict[str, Dict[str, Any]]] = {}  # per-chat in-memory
 
 def d(x, q=8):
@@ -43,6 +45,84 @@ def fmt_usd(x: Decimal) -> str:
 def build_pair_url(pair: Dict[str, Any]) -> str:
     return pair.get("url") or "https://dexscreener.com/solana"
 
+# ---------- persistence helpers ----------
+def _state_to_jsonable(state: Dict[int, Dict[str, Dict[str, Any]]]) -> Dict[str, Any]:
+    """Convert Decimals/tuples to JSON-friendly forms."""
+    out: Dict[str, Any] = {}
+    for chat_id, contracts in state.items():
+        chat_key = str(chat_id)
+        out[chat_key] = {}
+        for contract, st in contracts.items():
+            out_st = dict(st)
+            # convert Decimals to strings
+            for key in ["L", "H", "fib75"]:
+                if key in out_st and isinstance(out_st[key], Decimal):
+                    out_st[key] = str(out_st[key])
+            if "band" in out_st:
+                lo, hi = out_st["band"]
+                out_st["band"] = [str(lo), str(hi)]
+            if "last_price" in out_st and isinstance(out_st["last_price"], Decimal):
+                out_st["last_price"] = str(out_st["last_price"])
+            out[chat_key][contract] = out_st
+    return out
+
+def _jsonable_to_state(data: Dict[str, Any]) -> Dict[int, Dict[str, Dict[str, Any]]]:
+    """Convert strings back to Decimals/tuples."""
+    restored: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    for chat_key, contracts in (data or {}).items():
+        try:
+            chat_id = int(chat_key)
+        except Exception:
+            continue
+        restored[chat_id] = {}
+        for contract, st in contracts.items():
+            st2 = dict(st)
+            for key in ["L", "H", "fib75"]:
+                if key in st2 and isinstance(st2[key], str):
+                    try: st2[key] = Decimal(st2[key])
+                    except Exception: st2[key] = Decimal("0")
+            if "band" in st2 and isinstance(st2["band"], list) and len(st2["band"]) == 2:
+                try:
+                    st2["band"] = (Decimal(st2["band"][0]), Decimal(st2["band"][1]))
+                except Exception:
+                    st2["band"] = (Decimal("0"), Decimal("0"))
+            if "last_price" in st2 and isinstance(st2["last_price"], str):
+                try: st2["last_price"] = Decimal(st2["last_price"])
+                except Exception: st2["last_price"] = None
+            # sanity defaults
+            st2.setdefault("status", "outside")
+            st2.setdefault("first_tick", True)
+            st2.setdefault("alerts_sent", 0)
+            st2.setdefault("pair", {})
+            st2.setdefault("name", st2.get("name") or "")
+            restored[chat_id][contract] = st2
+    return restored
+
+def save_state():
+    try:
+        data = _state_to_jsonable(chat_state)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, STATE_PATH)  # atomic on POSIX
+        print(f"[STATE] saved to {STATE_PATH}")
+    except Exception as e:
+        print(f"[STATE] save error: {e}")
+
+def load_state():
+    global chat_state
+    try:
+        if not os.path.exists(STATE_PATH):
+            print(f"[STATE] no existing state at {STATE_PATH}")
+            return
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        chat_state = _jsonable_to_state(data)
+        print(f"[STATE] loaded from {STATE_PATH}")
+    except Exception as e:
+        print(f"[STATE] load error: {e}")
+
+# --------- API helpers ----------
 async def fetch_top_pair(contract: str) -> Optional[Dict[str, Any]]:
     url = DEX_API.format(contract=contract)
     try:
@@ -79,19 +159,18 @@ async def get_price_usd_from_pair(pair: Dict[str, Any]) -> Optional[Decimal]:
         return None
 
 # --------- Commands ---------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[CMD] /start from chat={update.effective_chat.id}")
     await update.message.reply_text(
-        "🔥 NEW BUILD v1.3 — name support ON.\n\n"
+        "💾 v1.5 — persistence ON (auto-saves watchlist).\n\n"
         "Commands:\n"
         "/add <contract> <low_usd> <high_usd> [name]\n"
         "/remove <contract>\n"
         "/list\n"
         "/clear\n"
         "/version\n"
-        "/ping\n\n"
-        "Tip: put a custom name at the end so you can recognize each watch."
+        "/ping\n"
+        f"(State file: {STATE_PATH})"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -100,7 +179,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[CMD] /version from chat={update.effective_chat.id}")
     sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "no-commit")
-    await update.message.reply_text(f"fib75-bot version 1.3 (name support) | commit: {sha}")
+    await update.message.reply_text(f"fib75-bot version 1.5 (persistence) | commit: {sha}")
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[CMD] /ping from chat={update.effective_chat.id}")
@@ -139,19 +218,18 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display_name = name_given if name_given else auto_name
 
     chat_state[chat_id][contract] = {
-    "name": display_name,
-    "L": L, "H": H,
-    "fib75": fib75,
-    "band": (lo, hi),
-    "status": "outside",
-    "first_tick": True,
-    "alerts_sent": 0,
-    "pair": {
-        "url": build_pair_url(pair)  # store the Dexscreener link right away
+        "name": display_name,
+        "L": L, "H": H,
+        "fib75": fib75,
+        "band": (lo, hi),
+        "status": "outside",
+        "first_tick": True,
+        "alerts_sent": 0,
+        "pair": {},
+        "last_price": None
     }
-}
 
-
+    save_state()
     print(f"[ADD] chat={chat_id} contract={contract} name='{display_name}' L={L} H={H} fib75={fib75}")
     await update.message.reply_text(
         f"Added *{display_name}* (`{contract}`).\n"
@@ -169,6 +247,7 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /remove <contract>")
     contract = parts[1]
     existed = chat_state[chat_id].pop(contract, None)
+    save_state()
     if existed:
         await update.message.reply_text(f"Removed {existed.get('name', contract)}.")
     else:
@@ -183,33 +262,27 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for contract, st in chat_state[chat_id].items():
         lo, hi = st["band"]
         name = st.get("name") or contract
-        pair_url = st.get("pair", {}).get("url")
-
-entry = (
-    f"- *{name}* (`{contract}`)\n"
-    f"  Fib75: {fmt_usd(st['fib75'])} | Band: [{fmt_usd(lo)} — {fmt_usd(hi)}] | Alerts: {st['alerts_sent']}/2"
-)
-
-if pair_url:
-    entry += f"\n  [Dexscreener]({pair_url})"
-
-lines.append(entry)
-
+        lines.append(
+            f"- *{name}*  (`{contract}`)\n"
+            f"  Fib75: {fmt_usd(st['fib75'])} | Band: [{fmt_usd(lo)} — {fmt_usd(hi)}] | Alerts: {st['alerts_sent']}/2"
+        )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ensure_chat(chat_id)
     chat_state[chat_id].clear()
+    save_state()
     await update.message.reply_text("Cleared all tracked contracts for this chat.")
 
 # -------- background price loop --------
 async def poll_job(context_like):
+    changed = False
     for chat_id, contracts in list(chat_state.items()):
         to_remove = []
         for contract, st in list(contracts.items()):
             if st["alerts_sent"] >= 2:
-                to_remove.append(contract); continue
+                to_remove.append(contract); changed = True; continue
             pair = await fetch_top_pair(contract)
             if not pair:
                 continue
@@ -221,12 +294,12 @@ async def poll_job(context_like):
             st["pair"] = {"url": build_pair_url(pair), "dex": pair.get("dexId"), "base": base_sym, "quote": quote_sym}
             if not st.get("name"):
                 st["name"] = f"{base_sym}/{quote_sym}" if base_sym and quote_sym else base_sym
+                changed = True
             lo, hi = st["band"]
             inside = within_band(price, lo, hi)
             if inside and (st["status"] == "outside" or st["first_tick"]):
-                st["alerts_sent"] += 1
-                st["status"] = "inside"
-                st["first_tick"] = False
+                st["alerts_sent"] += 1; changed = True
+                st["status"] = "inside"; st["first_tick"] = False
                 if st["alerts_sent"] <= 2:
                     msg = (
                         "🚨 *75% Fib Retracement Alert!* 🚨\n"
@@ -246,20 +319,24 @@ async def poll_job(context_like):
                 if st["alerts_sent"] >= 2:
                     to_remove.append(contract)
             else:
-                st["status"] = "inside" if inside else "outside"
+                new_status = "inside" if inside else "outside"
+                if new_status != st["status"]:
+                    st["status"] = new_status; changed = True
             st["last_price"] = price
         for c in to_remove:
             contracts.pop(c, None)
+    if changed:
+        save_state()
 
 async def poll_loop(application):
-    # delete webhook so polling gets updates
+    # Ensure polling works even if a webhook was set earlier
     try:
         await application.bot.delete_webhook(drop_pending_updates=False)
         print("[INIT] delete_webhook ok")
     except Exception as e:
         print(f"[WARN] delete_webhook: {e}")
     while True:
-        class Ctx:  # tiny shim to reuse poll_job
+        class Ctx:
             bot = application.bot
         try:
             await poll_job(Ctx)
@@ -270,6 +347,8 @@ async def poll_loop(application):
 def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN env var")
+    load_state()  # load from disk on startup
+
     app = (ApplicationBuilder().token(TELEGRAM_TOKEN).build())
 
     # handlers

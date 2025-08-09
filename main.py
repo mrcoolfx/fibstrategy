@@ -18,7 +18,7 @@ DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{contract}"
 chat_state: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
 POLL_SECONDS = 5 * 60  # 5 minutes
-HEADERS = {"User-Agent": "fib75-telegram-bot/1.1"}
+HEADERS = {"User-Agent": "fib75-telegram-bot/1.2"}
 
 def d(x, q=8):
     if not isinstance(x, Decimal):
@@ -53,7 +53,7 @@ async def fetch_top_pair(contract: str) -> Optional[Dict[str, Any]]:
     best = None
     for p in pairs:
         try:
-            if (p.get("chainId") != "solana"):
+            if p.get("chainId") != "solana":
                 continue
             vol = Decimal(str(((p.get("volume") or {}).get("h24")) or 0))
             liq = Decimal(str(((p.get("liquidity") or {}).get("usd")) or 0))
@@ -90,8 +90,8 @@ def build_pair_url(pair: Dict[str, Any]) -> str:
 
 async def poll_job(context_like):
     """
-    This is called by our own background loop every POLL_SECONDS.
-    `context_like` is a tiny object that just has `.bot`.
+    Called by our own background loop every POLL_SECONDS.
+    `context_like` just needs `.bot`.
     """
     for chat_id, contracts in list(chat_state.items()):
         to_remove = []
@@ -108,7 +108,6 @@ async def poll_job(context_like):
             if price is None:
                 continue
 
-            # Keep latest pair info (useful if URL/symbol changes)
             base_sym = (pair.get("baseToken") or {}).get("symbol") or (pair.get("baseToken") or {}).get("name") or "Token"
             quote_sym = (pair.get("quoteToken") or {}).get("symbol") or (pair.get("quoteToken") or {}).get("name") or ""
             st["pair"] = {
@@ -120,10 +119,7 @@ async def poll_job(context_like):
 
             # Auto-fill name if none was provided
             if not st.get("name"):
-                if base_sym and quote_sym:
-                    st["name"] = f"{base_sym}/{quote_sym}"
-                else:
-                    st["name"] = base_sym
+                st["name"] = f"{base_sym}/{quote_sym}" if base_sym and quote_sym else base_sym
 
             lo, hi = st["band"]
             now_inside = within_band(price, lo, hi)
@@ -169,9 +165,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/add <contract> <low_usd> <high_usd> [name]\n"
         "/remove <contract>\n"
         "/list\n"
-        "/clear\n\n"
-        "Tip: You can add an optional name at the end so you recognize each watch easily."
+        "/clear\n"
+        "/version\n\n"
+        "Tip: Add an optional name at the end so you recognize each watch easily."
     )
+
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("fib75-bot version 1.2 (name support)")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
@@ -180,7 +180,8 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ensure_chat(chat_id)
 
-    parts = (update.message.text or "").split()
+    raw = (update.message.text or "")
+    parts = raw.split()
     if len(parts) < 4:
         return await update.message.reply_text("Usage: /add <contract> <low_usd> <high_usd> [name]")
 
@@ -198,7 +199,6 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fib75 = compute_fib75(L, H)
     lo, hi = band_bounds(fib75)
 
-    # quick sanity: fetch once to confirm a valid pair exists
     pair = await fetch_top_pair(contract)
     if not pair:
         return await update.message.reply_text("Could not find a valid Solana pair for that contract (24h volume/liquidity required).")
@@ -219,6 +219,9 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pair": {},
         "last_price": None
     }
+
+    # Log to Railway for your sanity
+    print(f"[ADD] chat={chat_id} contract={contract} name='{display_name}' L={L} H={H} fib75={fib75}")
 
     await update.message.reply_text(
         f"Added *{display_name}* (`{contract}`).\n"
@@ -292,6 +295,7 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("version", version_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CommandHandler("list", list_cmd))

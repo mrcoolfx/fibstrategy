@@ -168,9 +168,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     "/clear\n"
     "/version"
 )
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("fib75-bot version 1.3 (name support)")
 
-async def version_cmd(update, context):
-    await update.message.reply_text("NEW v1.3 @ " + os.environ.get("RAILWAY_GIT_COMMIT_SHA", "no-commit"))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)

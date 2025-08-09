@@ -18,7 +18,7 @@ DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{contract}"
 chat_state: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
 POLL_SECONDS = 5 * 60  # 5 minutes
-HEADERS = {"User-Agent": "fib75-telegram-bot/1.2"}
+HEADERS = {"User-Agent": "fib75-telegram-bot/NEW-1.3"}
 
 def d(x, q=8):
     if not isinstance(x, Decimal):
@@ -159,19 +159,18 @@ async def poll_job(context_like):
 # ---------- Telegram commands ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hi! I watch Solana tokens for a 75% retracement (±2% band) on Dexscreener and alert you at most twice.\n\n"
-        "Commands:\n"
-        "/add <contract> <low_usd> <high_usd> [name]\n"
-        "/remove <contract>\n"
-        "/list\n"
-        "/clear\n"
-        "/version\n\n"
-        "Tip: Add an optional name at the end so you recognize each watch easily."
-    )
+  await update.message.reply_text(
+    "🔥 NEW BUILD v1.3 — name support ON.\n\n"
+    "Commands:\n"
+    "/add <contract> <low_usd> <high_usd> [name]\n"
+    "/remove <contract>\n"
+    "/list\n"
+    "/clear\n"
+    "/version"
+)
 
-async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("fib75-bot version 1.2 (name support)")
+async def version_cmd(update, context):
+    await update.message.reply_text("NEW v1.3 @ " + os.environ.get("RAILWAY_GIT_COMMIT_SHA", "no-commit"))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)

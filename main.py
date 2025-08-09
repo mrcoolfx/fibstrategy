@@ -1,344 +1,306 @@
-
 import asyncio
-import json
-import logging
 import os
-from dataclasses import dataclass, asdict
-from decimal import Decimal, ROUND_HALF_UP, getcontext
-from typing import Dict, Optional, Tuple
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Dict, Any, Optional
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes
 )
 
-# ---------- Logging ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-log = logging.getLogger("fib75_bot")
-
-# ---------- Decimal precision ----------
-getcontext().prec = 28  # generous precision to avoid float drift
-
-# ---------- Config ----------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "300"))  # 5 minutes default
-PERSIST_JSON_PATH = os.environ.get("PERSIST_JSON_PATH", "")  # optional persistence
-
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{contract}"
 
-# ---------- Data models ----------
-class Pair(BaseModel):
-    chainId: str = Field(default="")
-    url: Optional[str] = None
-    priceUsd: Optional[str] = None
-    # nested fields can be absent; use dict access with .get
-    liquidity: Optional[dict] = None
-    volume: Optional[dict] = None
-    # Sometimes 'updatedAt' or 'pairCreatedAt' exists; we won't rely on them strictly
+# -------- In-memory state (per chat) --------
+# chat_state = { chat_id: { contract: TokenState, ... } }
+chat_state: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
-class TokenState(BaseModel):
-    contract: str
-    low_usd: Decimal
-    high_usd: Decimal
-    fib75_usd: Decimal
-    band_min: Decimal
-    band_max: Decimal
-    alerts_sent: int = 0
-    prev_position: str = "unknown"   # "below" | "inside" | "above" | "unknown"
-    token_name: str = ""
-    pair_url: str = ""
+POLL_SECONDS = 5 * 60  # 5 minutes
+HEADERS = {"User-Agent": "fib75-telegram-bot/1.1"}
 
-# ---------- Global watchlist in memory ----------
-WATCHLIST: Dict[str, TokenState] = {}
+def d(x, q=8):
+    if not isinstance(x, Decimal):
+        x = Decimal(str(x))
+    return x.quantize(Decimal(10) ** -q, rounding=ROUND_HALF_UP)
 
-# ---------- Helpers ----------
-def dquant(x: Decimal, places=6) -> Decimal:
-    q = Decimal("1." + "0"*places)
-    return x.quantize(q, rounding=ROUND_HALF_UP)
+def compute_fib75(L: Decimal, H: Decimal) -> Decimal:
+    # 75% retracement toward the low: Fib75 = L + 0.25*(H-L)
+    return L + Decimal("0.25") * (H - L)
 
-def parse_decimal(s: str) -> Optional[Decimal]:
+def band_bounds(fib75: Decimal) -> (Decimal, Decimal):
+    return (fib75 * Decimal("0.98"), fib75 * Decimal("1.02"))
+
+def within_band(price: Decimal, lo: Decimal, hi: Decimal) -> bool:
+    return lo <= price <= hi
+
+async def fetch_top_pair(contract: str) -> Optional[Dict[str, Any]]:
+    """
+    Query Dexscreener for the contract, filter to Solana pairs,
+    choose highest 24h volume, tiebreak by highest 24h liquidity.
+    """
+    url = DEX_API.format(contract=contract)
     try:
-        return Decimal(str(s))
+        async with httpx.AsyncClient(timeout=10, headers=HEADERS) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
     except Exception:
         return None
 
-def pick_top_pair(pairs: list) -> Optional[Pair]:
-    # Filter to Solana pairs only
-    sol_pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
-    if not sol_pairs:
+    pairs = data.get("pairs") or []
+    best = None
+    for p in pairs:
+        try:
+            if (p.get("chainId") != "solana"):
+                continue
+            vol = Decimal(str(((p.get("volume") or {}).get("h24")) or 0))
+            liq = Decimal(str(((p.get("liquidity") or {}).get("usd")) or 0))
+            score = (vol, liq)
+            if best is None or score > best[0]:
+                best = (score, p)
+        except Exception:
+            continue
+
+    return best[1] if best else None
+
+async def get_price_usd_from_pair(pair: Dict[str, Any]) -> Optional[Decimal]:
+    try:
+        price_str = pair.get("priceUsd")
+        if price_str is None:
+            return None
+        return Decimal(str(price_str))
+    except (InvalidOperation, TypeError):
         return None
 
-    def vol_h24(p):
-        v = (p.get("volume") or {}).get("h24")
-        try:
-            return float(v)
-        except Exception:
-            return -1.0
+def ensure_chat(chat_id: int):
+    if chat_id not in chat_state:
+        chat_state[chat_id] = {}
 
-    def liq_usd(p):
-        l = (p.get("liquidity") or {}).get("usd")
-        try:
-            return float(l)
-        except Exception:
-            return -1.0
-
-    sol_pairs.sort(key=lambda p: (vol_h24(p), liq_usd(p)), reverse=True)
-    try:
-        return Pair.model_validate(sol_pairs[0])
-    except ValidationError:
-        return None
-
-async def fetch_best_pair(contract: str) -> Optional[Pair]:
-    url = DEX_API.format(contract=contract)
-    timeout = httpx.Timeout(10, connect=5)
-    async with httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"}) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            log.warning("Dexscreener %s -> %s", url, r.status_code)
-            return None
-        data = r.json()
-        pairs = data.get("pairs") or []
-        if not isinstance(pairs, list):
-            return None
-        return pick_top_pair(pairs)
-
-def position(price: Decimal, band_min: Decimal, band_max: Decimal) -> str:
-    if price < band_min:
-        return "below"
-    if price > band_max:
-        return "above"
-    return "inside"
-
-def compute_fib_band(low: Decimal, high: Decimal) -> Tuple[Decimal, Decimal, Decimal]:
-    # Fib75 (25% above the low) = L + 0.25 * (H - L)
-    fib = low + (Decimal("0.25") * (high - low))
-    band_min = fib * Decimal("0.98")
-    band_max = fib * Decimal("1.02")
-    return (fib, band_min, band_max)
-
-def persist_state():
-    if not PERSIST_JSON_PATH:
-        return
-    try:
-        payload = {k: v.model_dump() for k, v in WATCHLIST.items()}
-        with open(PERSIST_JSON_PATH, "w") as f:
-            json.dump(payload, f, default=str, indent=2)
-    except Exception as e:
-        log.warning("Persist error: %s", e)
-
-def load_state():
-    if not PERSIST_JSON_PATH:
-        return
-    try:
-        if os.path.exists(PERSIST_JSON_PATH):
-            with open(PERSIST_JSON_PATH) as f:
-                payload = json.load(f)
-            for k, v in payload.items():
-                # restore decimals
-                for fld in ("low_usd","high_usd","fib75_usd","band_min","band_max"):
-                    v[fld] = Decimal(v[fld])
-                WATCHLIST[k] = TokenState(**v)
-            log.info("Restored %d tokens from %s", len(WATCHLIST), PERSIST_JSON_PATH)
-    except Exception as e:
-        log.warning("Load error: %s", e)
-
-# ---------- Command handlers ----------
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args) != 3:
-        await update.message.reply_text("Usage: /add <contract> <low_usd> <high_usd>")
-        return
-    contract, low_s, high_s = context.args
-    low = parse_decimal(low_s)
-    high = parse_decimal(high_s)
-    if low is None or high is None:
-        await update.message.reply_text("Invalid number. Use plain decimals for low/high.")
-        return
-    if not (Decimal("0") <= low < high):
-        await update.message.reply_text("Constraint: 0 <= low < high")
-        return
-
-    fib, bmin, bmax = compute_fib_band(low, high)
-
-    # Fetch a pair once here (optional) for name/url preview
-    pair = await fetch_best_pair(contract)
-    token_name = ""
-    pair_url = ""
-    if pair:
-        token_name = (pair.url or "").split("/")[-1] if pair.url else ""
-        pair_url = pair.url or ""
-
-    WATCHLIST[contract] = TokenState(
-        contract=contract,
-        low_usd=low,
-        high_usd=high,
-        fib75_usd=fib,
-        band_min=bmin,
-        band_max=bmax,
-        alerts_sent=0,
-        prev_position="unknown",
-        token_name=token_name,
-        pair_url=pair_url
-    )
-    persist_state()
-    await update.message.reply_text(
-        f"Added {contract}\n"
-        f"Fib75: {dquant(fib)} USD\n"
-        f"Band: [{dquant(bmin)} – {dquant(bmax)}] USD\n"
-        f"Alerts: {0}/2"
-    )
-
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("Usage: /remove <contract>")
-        return
-    contract = context.args[0]
-    if contract in WATCHLIST:
-        WATCHLIST.pop(contract, None)
-        persist_state()
-        await update.message.reply_text(f"Removed {contract}")
+def fmt_usd(x: Decimal) -> str:
+    # Adaptive decimals for microcaps vs large caps
+    if x >= Decimal("1"):
+        return f"{x.quantize(Decimal('0.0001'))} USD"
     else:
-        await update.message.reply_text("Not tracking that contract.")
+        return f"{x.quantize(Decimal('0.0000001'))} USD"
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not WATCHLIST:
-        await update.message.reply_text("No tokens are being tracked.")
-        return
-    lines = []
-    for t in WATCHLIST.values():
-        lines.append(
-            f"{t.contract}\n"
-            f"  Fib75: {dquant(t.fib75_usd)} USD | Band: [{dquant(t.band_min)} – {dquant(t.band_max)}] USD\n"
-            f"  Alerts: {t.alerts_sent}/2 | Last pair: {t.pair_url or 'n/a'}"
-        )
-    await update.message.reply_text("\n\n".join(lines))
+def build_pair_url(pair: Dict[str, Any]) -> str:
+    return pair.get("url") or "https://dexscreener.com/solana"
 
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    WATCHLIST.clear()
-    persist_state()
-    await update.message.reply_text("Cleared all tracked tokens.")
+async def poll_job(context_like):
+    """
+    This is called by our own background loop every POLL_SECONDS.
+    `context_like` is a tiny object that just has `.bot`.
+    """
+    for chat_id, contracts in list(chat_state.items()):
+        to_remove = []
+        for contract, st in list(contracts.items()):
+            if st["alerts_sent"] >= 2:
+                to_remove.append(contract)
+                continue
 
-# ---------- Alert loop ----------
-async def alert_loop(app):
-    await asyncio.sleep(2)  # small delay after startup
-    log.info("Alert loop started; interval=%ss", POLL_SECONDS)
-    while True:
-        if WATCHLIST:
-            # Copy keys to avoid RuntimeError on mutation during iteration
-            contracts = list(WATCHLIST.keys())
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5)) as client:
-                for contract in contracts:
-                    state = WATCHLIST.get(contract)
-                    if not state:
-                        continue
-                    # Auto-stop if already 2 alerts (paranoia)
-                    if state.alerts_sent >= 2:
-                        WATCHLIST.pop(contract, None)
-                        persist_state()
-                        continue
+            pair = await fetch_top_pair(contract)
+            if not pair:
+                continue
 
-                    # Get best pair
+            price = await get_price_usd_from_pair(pair)
+            if price is None:
+                continue
+
+            # Keep latest pair info (useful if URL/symbol changes)
+            base_sym = (pair.get("baseToken") or {}).get("symbol") or (pair.get("baseToken") or {}).get("name") or "Token"
+            quote_sym = (pair.get("quoteToken") or {}).get("symbol") or (pair.get("quoteToken") or {}).get("name") or ""
+            st["pair"] = {
+                "url": build_pair_url(pair),
+                "dex": pair.get("dexId"),
+                "base": base_sym,
+                "quote": quote_sym,
+            }
+
+            # Auto-fill name if none was provided
+            if not st.get("name"):
+                if base_sym and quote_sym:
+                    st["name"] = f"{base_sym}/{quote_sym}"
+                else:
+                    st["name"] = base_sym
+
+            lo, hi = st["band"]
+            now_inside = within_band(price, lo, hi)
+
+            if now_inside and (st["status"] == "outside" or st["first_tick"]):
+                st["alerts_sent"] += 1
+                st["status"] = "inside"
+                st["first_tick"] = False
+
+                if st["alerts_sent"] <= 2:
+                    msg = (
+                        "🚨 *75% Fib Retracement Alert!* 🚨\n"
+                        f"*Watch:* {st['name']}\n"
+                        f"*Token:* {st['pair']['base']}\n"
+                        f"*Level Hit:* {fmt_usd(st['fib75'])}\n"
+                        f"*Band:* [{fmt_usd(lo)} — {fmt_usd(hi)}]\n"
+                        f"*Price Now:* {fmt_usd(price)}\n"
+                        f"*Pair:* {st['pair']['dex']} / {st['pair']['quote']}\n"
+                        f"[Dexscreener]({st['pair']['url']})\n"
+                        f"_Alerts sent for this contract:_ {st['alerts_sent']}/2"
+                    )
                     try:
-                        resp = await client.get(DEX_API.format(contract=contract), headers={"Accept": "application/json"})
-                        if resp.status_code != 200:
-                            log.warning("Dexscreener fetch %s -> %s", contract, resp.status_code)
-                            continue
-                        data = resp.json()
-                        pairs = data.get("pairs") or []
-                        best = pick_top_pair(pairs)
-                        if not best:
-                            log.info("No valid Solana pair for %s", contract)
-                            continue
+                        await context_like.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        pass
 
-                        state.token_name = state.token_name or (best.url or "").split("/")[-1]
-                        state.pair_url = best.url or state.pair_url
+                if st["alerts_sent"] >= 2:
+                    to_remove.append(contract)
+            else:
+                st["status"] = "inside" if now_inside else "outside"
 
-                        price = None
-                        if best.priceUsd is not None:
-                            price = parse_decimal(best.priceUsd)
+            st["last_price"] = price
 
-                        if price is None:
-                            # skip cycle if no price
-                            continue
+        for c in to_remove:
+            contracts.pop(c, None)
 
-                        pos_now = position(price, state.band_min, state.band_max)
+# ---------- Telegram commands ----------
 
-                        if state.prev_position in ("below", "above") and pos_now == "inside" and state.alerts_sent < 2:
-                            # Fire alert
-                            text = (
-                                "🚨 75% Fib Retracement Alert! 🚨\n"
-                                f"Token: {state.token_name or contract}\n"
-                                f"Level Hit: {dquant(state.fib75_usd)} USD\n"
-                                f"Range: [{dquant(state.band_min)} – {dquant(state.band_max)}] USD\n"
-                                f"Price: {dquant(price)} USD\n"
-                                f"Dexscreener: {state.pair_url or 'n/a'}"
-                            )
-                            # Broadcast to all chats is out-of-scope; reply to last chat isn't reliable.
-                            # Minimal approach: we store last chat_id seen in this process (single-user bot typical).
-                            chat_id = app.bot_data.get("last_chat_id")
-                            if chat_id:
-                                await app.bot.send_message(chat_id=chat_id, text=text)
-                            state.alerts_sent += 1
-                            if state.alerts_sent >= 2:
-                                # auto stop
-                                WATCHLIST.pop(contract, None)
-                            persist_state()
-
-                        state.prev_position = pos_now
-
-                    except Exception as e:
-                        log.exception("Loop error for %s: %s", contract, e)
-
-        await asyncio.sleep(POLL_SECONDS)
-
-# ---------- Utilities to capture a chat_id ----------
-async def remember_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # store last chat id to send alerts back
-    context.application.bot_data["last_chat_id"] = update.effective_chat.id
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await remember_chat_id(update, context)
-    await update.message.reply_text("Bot is up. Use /add <contract> <low> <high> to begin.")
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await remember_chat_id(update, context)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/add <contract> <low> <high>\n"
+        "Hi! I watch Solana tokens for a 75% retracement (±2% band) on Dexscreener and alert you at most twice.\n\n"
+        "Commands:\n"
+        "/add <contract> <low_usd> <high_usd> [name]\n"
         "/remove <contract>\n"
         "/list\n"
-        "/clear"
+        "/clear\n\n"
+        "Tip: You can add an optional name at the end so you recognize each watch easily."
     )
 
-# ---------- Main ----------
-def main():
-    load_state()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("clear", cmd_clear))
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ensure_chat(chat_id)
 
-    # background task
-    # app.job_queue.run_repeating(lambda ctx: None, interval=3600)  # keep JobQueue alive
-    # start alert loop
-    async def _post_init(app):
-        app.create_task(alert_loop(app))
+    parts = (update.message.text or "").split()
+    if len(parts) < 4:
+        return await update.message.reply_text("Usage: /add <contract> <low_usd> <high_usd> [name]")
 
-    app.post_init = _post_init
+    contract, Ls, Hs = parts[1], parts[2], parts[3]
+    name_given = " ".join(parts[4:]).strip() if len(parts) > 4 else ""
 
+    try:
+        L = Decimal(Ls)
+        H = Decimal(Hs)
+        if not (L < H):
+            return await update.message.reply_text("Low must be < High. Try again.")
+    except InvalidOperation:
+        return await update.message.reply_text("Low/High must be numbers in USD. Try again.")
 
-    log.info("Starting bot...")
-    app.run_polling(close_loop=False)
+    fib75 = compute_fib75(L, H)
+    lo, hi = band_bounds(fib75)
+
+    # quick sanity: fetch once to confirm a valid pair exists
+    pair = await fetch_top_pair(contract)
+    if not pair:
+        return await update.message.reply_text("Could not find a valid Solana pair for that contract (24h volume/liquidity required).")
+
+    base_sym = (pair.get("baseToken") or {}).get("symbol") or (pair.get("baseToken") or {}).get("name") or "Token"
+    quote_sym = (pair.get("quoteToken") or {}).get("symbol") or (pair.get("quoteToken") or {}).get("name") or ""
+    auto_name = f"{base_sym}/{quote_sym}" if base_sym and quote_sym else base_sym
+    display_name = name_given if name_given else auto_name
+
+    chat_state[chat_id][contract] = {
+        "name": display_name,
+        "L": L, "H": H,
+        "fib75": fib75,
+        "band": (lo, hi),
+        "status": "outside",
+        "first_tick": True,   # if first poll lands inside, send one alert
+        "alerts_sent": 0,
+        "pair": {},
+        "last_price": None
+    }
+
+    await update.message.reply_text(
+        f"Added *{display_name}* (`{contract}`).\n"
+        f"Fib75: {fmt_usd(fib75)}\n"
+        f"Band: [{fmt_usd(lo)} — {fmt_usd(hi)}]\n"
+        f"Max alerts: 2 (auto-stop).\n"
+        f"Polling every 5 minutes.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ensure_chat(chat_id)
+
+    parts = (update.message.text or "").split()
+    if len(parts) != 2:
+        return await update.message.reply_text("Usage: /remove <contract>")
+
+    contract = parts[1]
+    existed = chat_state[chat_id].pop(contract, None)
+    if existed:
+        await update.message.reply_text(f"Removed {existed.get('name', contract)}.")
+    else:
+        await update.message.reply_text("That contract was not being tracked.")
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ensure_chat(chat_id)
+
+    if not chat_state[chat_id]:
+        return await update.message.reply_text("Nothing is being tracked.")
+
+    lines = []
+    for contract, st in chat_state[chat_id].items():
+        lo, hi = st["band"]
+        name = st.get("name") or contract
+        lines.append(
+            f"- *{name}*  (`{contract}`)\n"
+            f"  Fib75: {fmt_usd(st['fib75'])} | Band: [{fmt_usd(lo)} — {fmt_usd(hi)}] | Alerts: {st['alerts_sent']}/2"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ensure_chat(chat_id)
+    chat_state[chat_id].clear()
+    await update.message.reply_text("Cleared all tracked contracts for this chat.")
+
+# -------- Background loop (no JobQueue needed) --------
+async def poll_loop(application):
+    while True:
+        class Ctx:
+            bot = application.bot
+        try:
+            await poll_job(Ctx)
+        except Exception:
+            # Keep the loop alive on transient errors
+            pass
+        await asyncio.sleep(POLL_SECONDS)
+
+async def main():
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN env var")
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("remove", remove_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+
+    print("Bot starting…")
+    asyncio.create_task(poll_loop(app))
+    print("Background poller started.")
+    await app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

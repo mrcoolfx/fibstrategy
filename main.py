@@ -286,21 +286,27 @@ async def main():
 
     app = (
         ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
+        .token(TELEGRAM_BOT_TOKEN)  # or TELEGRAM_TOKEN if that’s your var name
         .build()
     )
 
+    # handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("version", version_cmd))  # keep this
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
 
+    # spin up the background poller on the same loop
+    loop = asyncio.get_event_loop()
+    loop.create_task(poll_loop(app))
+
     print("Bot starting…")
-    asyncio.create_task(poll_loop(app))
     print("Background poller started.")
-    await app.run_polling(close_loop=False)
+    # IMPORTANT: let PTB manage the loop; don’t call asyncio.run here
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()  # <-- plain call, NOT asyncio.run(main())

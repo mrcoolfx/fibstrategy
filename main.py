@@ -183,10 +183,18 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for contract, st in chat_state[chat_id].items():
         lo, hi = st["band"]
         name = st.get("name") or contract
-        lines.append(
-            f"- *{name}*  (`{contract}`)\n"
-            f"  Fib75: {fmt_usd(st['fib75'])} | Band: [{fmt_usd(lo)} — {fmt_usd(hi)}] | Alerts: {st['alerts_sent']}/2"
-        )
+        pair_url = st.get("pair", {}).get("url")
+
+entry = (
+    f"- *{name}* (`{contract}`)\n"
+    f"  Fib75: {fmt_usd(st['fib75'])} | Band: [{fmt_usd(lo)} — {fmt_usd(hi)}] | Alerts: {st['alerts_sent']}/2"
+)
+
+if pair_url:
+    entry += f"\n  [Dexscreener]({pair_url})"
+
+lines.append(entry)
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):

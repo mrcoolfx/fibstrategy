@@ -256,17 +256,37 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ensure_chat(chat_id)
+
     if not chat_state[chat_id]:
         return await update.message.reply_text("Nothing is being tracked.")
+
     lines = []
+
     for contract, st in chat_state[chat_id].items():
-        lo, hi = st["band"]
         name = st.get("name") or contract
-        lines.append(
-            f"- *{name}*  (`{contract}`)\n"
-            f"  Fib75: {fmt_usd(st['fib75'])} | Band: [{fmt_usd(lo)} — {fmt_usd(hi)}] | Alerts: {st['alerts_sent']}/2"
+        lo, hi = st["band"]
+
+        # Try to use the saved Dexscreener URL; if missing, fetch once.
+        pair_url = (st.get("pair") or {}).get("url")
+        if not pair_url:
+            p = await fetch_top_pair(contract)
+            if p:
+                pair_url = build_pair_url(p)
+                st["pair"] = {
+                    "url": pair_url,
+                    "dex": p.get("dexId"),
+                    "base": (p.get("baseToken") or {}).get("symbol") or (p.get("baseToken") or {}).get("name") or "Token",
+                    "quote": (p.get("quoteToken") or {}).get("symbol") or (p.get("quoteToken") or {}).get("name") or "",
+                }
+
+        entry = (
+            f"{name}\n"
+            f"  Fib75: {fmt_usd(st['fib75'])} | Band: [{fmt_usd(lo)} — {fmt_usd(hi)}] USD\n"
+            f"  Alerts: {st['alerts_sent']}/2 | Last pair: {pair_url if pair_url else 'N/A'}"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        lines.append(entry)
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id

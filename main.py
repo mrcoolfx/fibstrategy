@@ -139,16 +139,18 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display_name = name_given if name_given else auto_name
 
     chat_state[chat_id][contract] = {
-        "name": display_name,
-        "L": L, "H": H,
-        "fib75": fib75,
-        "band": (lo, hi),
-        "status": "outside",
-        "first_tick": True,
-        "alerts_sent": 0,
-        "pair": {},
-        "last_price": None
+    "name": display_name,
+    "L": L, "H": H,
+    "fib75": fib75,
+    "band": (lo, hi),
+    "status": "outside",
+    "first_tick": True,
+    "alerts_sent": 0,
+    "pair": {
+        "url": build_pair_url(pair)  # store the Dexscreener link right away
     }
+}
+
 
     print(f"[ADD] chat={chat_id} contract={contract} name='{display_name}' L={L} H={H} fib75={fib75}")
     await update.message.reply_text(
